@@ -1,111 +1,123 @@
-import requests
-from bs4 import BeautifulSoup
-import time
-import pandas as pd
-from sqlalchemy import create_engine, Column, Integer, String
+from fastapi import FastAPI, HTTPException
+import asyncio
+import logging
+import aiohttp
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, select, text
 
-# Подключение к БД PostgreSQL
-DATABASE_URL = "postgresql://maxidom-products:0000@localhost:5432/maxidom-products"
+# Инициализация приложения FastAPI
+app = FastAPI()
+
+# Настройки логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Конфигурация базы данных
+DATABASE_URL = "postgresql+asyncpg://maxidom-products:0000@localhost:5432/maxidom-products"
+
 Base = declarative_base()
+engine = create_async_engine(DATABASE_URL, echo=False)
+async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# Модель таблицы для товаров
+CATEGORY = "nasosnoe-oborudovanie"
+INTERVAL = 10
+
 class Product(Base):
     __tablename__ = "products"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     price = Column(String)
 
-# Настройка движка и сессии
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Создание таблицы, если её ещё нет
-Base.metadata.create_all(bind=engine)
-
-# Функция для отправки запроса и получения HTML-кода страницы
-def fetch_page(url, headers):
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        print(f"Ошибка доступа к {url}: {e}")
-        return None
-
-# Функция для извлечения данных о товарах с одной страницы
-def parse_product_data(soup):
+async def fetch_product_data(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
     product_data = []
-    products = soup.find_all('article', class_='l-product')
-    for product in products:
-        name_tag = product.find('span', itemprop='name')
-        name = name_tag.text.strip() if name_tag else 'Название не указано'
-
-        price_tag = product.find('div', class_='l-product__price-base')
-        price = price_tag.text.strip().replace('\xa0', ' ') if price_tag else 'Цена не указана'
-
-        product_data.append({'name': name, 'price': price})
-
+    async with aiohttp.ClientSession() as session:
+        while url:
+            try:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        logger.error(f"Ошибка при парсинге: {response.status}")
+                        break
+                    html_content = await response.text()
+                    # Используем BeautifulSoup для парсинга
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html_content, "html.parser")
+                    products = soup.find_all("article", class_="l-product__horizontal")
+                    for product in products:
+                        name = product.find("span", itemprop="name").text.strip()
+                        price = product.find("div", class_="l-product__price-base").text.strip()
+                        product_data.append({"name": name, "price": price})
+                    next_page = soup.find("a", id="navigation_2_next_page")
+                    url = "https://www.maxidom.ru" + next_page["href"] if next_page else None
+            except Exception as e:
+                logger.error(f"Ошибка: {str(e)}")
+                break
     return product_data
 
-# Функция для перехода на следующую страницу
-def get_next_page_url(soup, base_url):
-    next_page = soup.find('a', id='navigation_2_next_page')
-    return base_url + next_page.get('href') if next_page else None
+async def save_products_to_db(products):
+    async with async_session() as session:
+        async with session.begin():
+            await session.execute(text("DELETE FROM products"))
+            for product_data in products:
+                product = Product(name=product_data["name"], price=product_data["price"])
+                session.add(product)
 
-# Функция для записи данных в базу данных
-def save_products_to_db(products):
-    session = SessionLocal()
-    try:
-        # Удаление старых данных
-        session.query(Product).delete()
-        session.commit()
+async def periodic_parsing():
+    start_url = f"https://www.maxidom.ru/catalog/{CATEGORY}/"
+    while True:
+        logger.info("Парсинг начался...")
+        products = await fetch_product_data(start_url)
+        await save_products_to_db(products)
+        await asyncio.sleep(INTERVAL)
 
-        # Добавление новых данных
-        for product_data in products:
-            product = Product(name=product_data["name"], price=product_data["price"])
-            session.add(product)
+@app.get("/")
+async def root():
+    return {"message": "API для парсинга запущен"}
 
-        session.commit()
-        print(f"Сохранено {len(products)} товаров в базу данных")
-    except Exception as e:
-        print(f"Ошибка при сохранении данных в БД: {e}")
-        session.rollback()
-    finally:   
-          session.close()
+@app.get("/products")
+async def get_products():
+    async with async_session() as session:
+        result = await session.execute(select(Product))
+        return result.scalars().all()
+    
+# Маршрут для получения товара по id
+@app.get("/products/{product_id}")
+async def get_product(product_id: int):
+    async with async_session() as session:
+        result = await session.execute(select(Product).filter(Product.id == product_id))
+        product = result.scalar_one_or_none()
+        if product is None:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        return product
+# Маршрут для редактирования товара по id
+@app.put("/products/{product_id}")
+async def update_product(product_id: int, name: str = None, price: str = None):
+    async with async_session() as session:
+        result = await session.execute(select(Product).filter(Product.id == product_id))
+        product = result.scalar_one_or_none()
+        if product is None:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        if name:
+            product.name = name
+        if price:
+            product.price = price
+        await session.commit()
+        return product
+# Маршрут для удаления товара по id
+@app.delete("/products/{product_id}")
+async def delete_product(product_id: int):
+    async with async_session() as session:
+        result = await session.execute(select(Product).filter(Product.id == product_id))
+        product = result.scalar_one_or_none()
+        if product is None:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        await session.delete(product)
+        await session.commit()
+        return {"detail": "Product deleted"}	
 
-# Основная функция для сбора данных по всем страницам с небольшой задержкой
-def collect_product_data(start_url, delay=1):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-    }
-    base_url = "https://www.maxidom.ru"
-    url = start_url
-    all_product_data = []
-
-    while url:
-        print(f"Сбор данных с {url}...")
-        page_html = fetch_page(url, headers)
-        if not page_html:
-            break
-
-        soup = BeautifulSoup(page_html, 'html.parser')
-        product_data = parse_product_data(soup)
-        all_product_data.extend(product_data)
-
-        # Переход на следующую страницу
-        url = get_next_page_url(soup, base_url)
-        if url:
-            time.sleep(delay)  # Пауза перед следующим запросом
-
-    return all_product_data
-
-# Заменить на нужную категорию
-category = "nasosnoe-oborudovanie"
-start_url = f"https://www.maxidom.ru/catalog/{category}/"
-
-# Сбор данных
-product_data = collect_product_data(start_url)
-
-# Сохранение данных в БД
-save_products_to_db(product_data)
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(periodic_parsing())
