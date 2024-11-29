@@ -5,6 +5,7 @@ import aiohttp
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, select, text
+from pydantic import BaseModel
 
 # Инициализация приложения FastAPI
 app = FastAPI()
@@ -22,6 +23,10 @@ async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession
 
 CATEGORY = "nasosnoe-oborudovanie"
 INTERVAL = 10
+
+class ProductUpdate(BaseModel):
+    name: str = None
+    price: str = None
 
 class Product(Base):
     __tablename__ = "products"
@@ -60,10 +65,16 @@ async def fetch_product_data(url):
 async def save_products_to_db(products):
     async with async_session() as session:
         async with session.begin():
-            await session.execute(text("DELETE FROM products"))
             for product_data in products:
-                product = Product(name=product_data["name"], price=product_data["price"])
-                session.add(product)
+                result = await session.execute(
+                    select(Product).filter(Product.name == product_data["name"])
+                )
+                product = result.scalar_one_or_none()
+                if product:
+                    product.price = product_data["price"]  # Обновляем цену
+                else:
+                    new_product = Product(name=product_data["name"], price=product_data["price"])
+                    session.add(new_product)
 
 async def periodic_parsing():
     start_url = f"https://www.maxidom.ru/catalog/{CATEGORY}/"
@@ -94,18 +105,21 @@ async def get_product(product_id: int):
         return product
 # Маршрут для редактирования товара по id
 @app.put("/products/{product_id}")
-async def update_product(product_id: int, name: str = None, price: str = None):
+async def update_product(product_id: int, product_update: ProductUpdate):
     async with async_session() as session:
         result = await session.execute(select(Product).filter(Product.id == product_id))
         product = result.scalar_one_or_none()
         if product is None:
-            raise HTTPException(status_code=404, detail="Товар не найден")
-        if name:
-            product.name = name
-        if price:
-            product.price = price
+            raise HTTPException(status_code=404, detail="Товар не найден")
+
+        # Обновляем только те поля, которые переданы в запросе
+        if product_update.name is not None:
+            product.name = product_update.name
+        if product_update.price is not None:
+            product.price = product_update.price
+
         await session.commit()
-        return product
+        return {"message": "Продукт обновлен", "product": {"id": product.id, "name": product.name, "price": product.price}}
 # Маршрут для удаления товара по id
 @app.delete("/products/{product_id}")
 async def delete_product(product_id: int):
