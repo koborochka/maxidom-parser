@@ -189,6 +189,28 @@ async def delete_product(product_id: int):
         await session.commit()
         await ws_manager.send_message(f"Продукт с ID={product_id} удален.")
         return {"detail": "Product deleted"}	
+    
+# Маршрут для добавления нового товара
+@app.post("/products")
+async def add_product(product: ProductUpdate):
+    async with async_session() as session:
+        async with session.begin():
+            # Проверяем, существует ли товар с таким же именем
+            result = await session.execute(select(Product).filter(Product.name == product.name))
+            existing_product = result.scalar_one_or_none()
+            if existing_product:
+                raise HTTPException(status_code=400, detail="Товар с таким именем уже существует")
+
+            # Создаем новый товар
+            new_product = Product(name=product.name, price=product.price)
+            session.add(new_product)
+            await session.commit()
+
+            # Отправляем сообщение через WebSocket
+            await ws_manager.send_message(f"Добавлен новый товар: {new_product.name}")
+
+            return {"message": "Товар добавлен", "product": {"id": new_product.id, "name": new_product.name, "price": new_product.price}}
+
 
 @app.on_event("startup")
 async def startup_event():
