@@ -1,28 +1,66 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.websockets import WebSocketState
+from typing import List
 import asyncio
 import logging
 import aiohttp
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, select, text
+from sqlalchemy import Column, Integer, String, select
 from pydantic import BaseModel
 
 # Инициализация приложения FastAPI
 app = FastAPI()
 
+class WebSocketManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            if connection.client_state == WebSocketState.CONNECTED:
+                await connection.send_text(message)
+
+    async def send_message(self, message: str):
+        await self.broadcast(message)
+
+ws_manager = WebSocketManager()
+
+
 # Настройки логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # Конфигурация базы данных
 DATABASE_URL = "postgresql+asyncpg://maxidom-products:0000@localhost:5432/maxidom-products"
-
 Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-CATEGORY = "nasosnoe-oborudovanie"
+
+AVAILABLE_CATEGORIES = [
+	"nasosnoe-oborudovanie", "kraski-i-emali", "dreli", "sadovaya-tehnika",
+	"zapchasti-dlya-sadovoy-tehniki", "unitazy",
+	"mebel-dlya-vannyh-komnat", "oborudovanie-dlya-dusha",
+	"smesiteli", "filtry-dlya-vody", "otopitelnoe-oborudovanie", "inzhenernaya-santehnika", "ventilyatsionnoe-oborudovanie", 
+    "aksessuary-dlya-vannoy-komnaty", "izmeritelnyy-instrument", "organizatsiya-rabochego-mesta", "otvertki", "klyuchi-golovki", 
+    "udarno-rychazhnyy-instrument", "svarochnoe-oborudovanie", "grunty-propitki-olify", "malyarno-shtukaturnyy-instrument", 
+    "sredstva-zaschitnye-dlya-dereva", "vyklyuchateli",
+	"rozetki-ramki-dlya-rozetok", "vse-dlya-elektromontazha",
+	"udliniteli-setevye-filtry-ibp", "stulya",
+	"melkaya-tehnika-dlya-kuhni", "posuda-i-pribory-dlya-vypechki"
+]
+CATEGORY = AVAILABLE_CATEGORIES[0]
 INTERVAL = 10
+
 
 class ProductUpdate(BaseModel):
     name: str = None
@@ -33,6 +71,7 @@ class Product(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     price = Column(String)
+
 
 async def fetch_product_data(url):
     headers = {
@@ -84,6 +123,17 @@ async def periodic_parsing():
         await save_products_to_db(products)
         await asyncio.sleep(INTERVAL)
 
+
+# WebSocket-эндпоинт
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+
 @app.get("/")
 async def root():
     return {"message": "API для парсинга запущен"}
@@ -92,6 +142,7 @@ async def root():
 async def get_products():
     async with async_session() as session:
         result = await session.execute(select(Product))
+        await ws_manager.send_message(f"Товары найдены.")
         return result.scalars().all()
     
 # Маршрут для получения товара по id
@@ -101,8 +152,12 @@ async def get_product(product_id: int):
         result = await session.execute(select(Product).filter(Product.id == product_id))
         product = result.scalar_one_or_none()
         if product is None:
+            await ws_manager.send_message(f"Товар с ID={product_id} не найден.")
             raise HTTPException(status_code=404, detail="Товар не найден")
+        await ws_manager.send_message(f"Товар с ID={product_id} найден.")
         return product
+    
+
 # Маршрут для редактирования товара по id
 @app.put("/products/{product_id}")
 async def update_product(product_id: int, product_update: ProductUpdate):
@@ -112,15 +167,17 @@ async def update_product(product_id: int, product_update: ProductUpdate):
         if product is None:
             raise HTTPException(status_code=404, detail="Товар не найден")
 
-        # Обновляем только те поля, которые переданы в запросе
         if product_update.name is not None:
             product.name = product_update.name
         if product_update.price is not None:
             product.price = product_update.price
 
         await session.commit()
+        await ws_manager.send_message(f"Продукт с ID={product_id} обновлен.")
         return {"message": "Продукт обновлен", "product": {"id": product.id, "name": product.name, "price": product.price}}
-# Маршрут для удаления товара по id
+    
+
+#Маршрут для удаления товара по id
 @app.delete("/products/{product_id}")
 async def delete_product(product_id: int):
     async with async_session() as session:
@@ -130,6 +187,7 @@ async def delete_product(product_id: int):
             raise HTTPException(status_code=404, detail="Товар не найден")
         await session.delete(product)
         await session.commit()
+        await ws_manager.send_message(f"Продукт с ID={product_id} удален.")
         return {"detail": "Product deleted"}	
 
 @app.on_event("startup")
